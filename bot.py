@@ -199,46 +199,70 @@ class KenoCloudMonitor:
             logger.error(f"Check error: {e}")
 
 async def monitor_loop():
-    """ULTRA FAST monitoring loop - checks every 1-2 seconds"""
-    monitor = KenoCloudMonitor()
+    """ULTRA FAST monitoring loop with CRASH PROTECTION"""
+    restart_count = 0
+    max_restarts = 10
     
-    if not monitor.telegram_token or not monitor.chat_id:
-        logger.error("Cannot start monitor - missing Telegram credentials")
-        return
-    
-    logger.info("🚀 Starting ULTRA-FAST Keno Monitor (1-2 second checks)")
-    
-    # Send startup message
-    try:
-        await monitor.send_telegram_alert(set(), "status")
-    except Exception as e:
-        logger.error(f"Failed to send startup message: {e}")
-    
-    # Ultra-fast monitoring loop
-    check_count = 0
-    while True:
+    while restart_count < max_restarts:
         try:
-            start_time = time.time()
-            await monitor.check_and_alert()
-            check_count += 1
+            monitor = KenoCloudMonitor()
             
-            # Send status every 150 checks (~3-5 minutes)
-            if check_count % 150 == 0:
+            if not monitor.telegram_token or not monitor.chat_id:
+                logger.error("Cannot start monitor - missing Telegram credentials")
+                await asyncio.sleep(30)
+                continue
+            
+            logger.info(f"🚀 Starting ULTRA-FAST Keno Monitor (Attempt {restart_count + 1})")
+            
+            # Send startup message
+            try:
+                await monitor.send_telegram_alert(set(), "status")
+            except Exception as e:
+                logger.error(f"Failed to send startup message: {e}")
+            
+            # Ultra-fast monitoring loop
+            check_count = 0
+            consecutive_errors = 0
+            max_consecutive_errors = 5
+            
+            while consecutive_errors < max_consecutive_errors:
                 try:
-                    await monitor.send_telegram_alert(set(), "status")
+                    start_time = time.time()
+                    await monitor.check_and_alert()
+                    check_count += 1
+                    consecutive_errors = 0  # Reset error counter on success
+                    
+                    # Send status every 100 checks (~3-4 minutes)
+                    if check_count % 100 == 0:
+                        try:
+                            await monitor.send_telegram_alert(set(), "status")
+                            logger.info("✅ Status update sent")
+                        except Exception as e:
+                            logger.error(f"Failed to send status update: {e}")
+                        check_count = 0
+                    
+                    # Dynamic sleep to maintain 1-2 second intervals
+                    processing_time = time.time() - start_time
+                    sleep_time = max(0.5, 2.0 - processing_time)
+                    
+                    await asyncio.sleep(sleep_time)
+                    
                 except Exception as e:
-                    logger.error(f"Failed to send status update: {e}")
-                check_count = 0
-            
-            # Dynamic sleep to maintain 1-2 second intervals
-            processing_time = time.time() - start_time
-            sleep_time = max(0.5, 2.0 - processing_time)  # Aim for 2 second total cycle, minimum 0.5 sleep
-            
-            await asyncio.sleep(sleep_time)
-            
+                    consecutive_errors += 1
+                    logger.error(f"Monitor loop error {consecutive_errors}/{max_consecutive_errors}: {e}")
+                    await asyncio.sleep(5)  # Longer sleep on error
+                    
+            # If we get here, too many consecutive errors occurred
+            logger.error(f"Too many consecutive errors ({consecutive_errors}). Restarting monitor...")
+            restart_count += 1
+            await asyncio.sleep(10)  # Wait before restart
+                    
         except Exception as e:
-            logger.error(f"Monitor loop error: {e}")
-            await asyncio.sleep(2)
+            restart_count += 1
+            logger.error(f"Monitor crashed! Restarting in 10 seconds... ({restart_count}/{max_restarts})")
+            await asyncio.sleep(10)
+    
+    logger.error("❌ Monitor failed too many times. Manual restart required.")
 
 def start_async_monitor():
     """Start the async monitor in event loop"""
@@ -247,19 +271,27 @@ def start_async_monitor():
 # Flask Web Server for UptimeRobot
 app = Flask(__name__)
 
+# Global variable to track monitor status
+monitor_status = {
+    "last_restart": time.time(),
+    "restart_count": 0,
+    "last_check": None
+}
+
 @app.route('/')
 def home():
-    return """
+    return f"""
     <html>
         <head>
             <title>Keno Monitor</title>
             <style>
-                body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
-                .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                .status { color: green; font-weight: bold; font-size: 18px; }
-                .info { margin: 20px 0; padding: 15px; background: #e8f4fd; border-radius: 5px; }
-                .ultra-fast { color: #ff4444; font-weight: bold; animation: pulse 1.5s infinite; }
-                @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.7; } 100% { opacity: 1; } }
+                body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
+                .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                .status {{ color: green; font-weight: bold; font-size: 18px; }}
+                .info {{ margin: 20px 0; padding: 15px; background: #e8f4fd; border-radius: 5px; }}
+                .ultra-fast {{ color: #ff4444; font-weight: bold; animation: pulse 1.5s infinite; }}
+                .warning {{ color: orange; font-weight: bold; }}
+                @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.7; }} 100% {{ opacity: 1; }} }}
             </style>
         </head>
         <body>
@@ -271,17 +303,19 @@ def home():
                     <p><strong>Monitoring:</strong> https://flashsport.bet/</p>
                     <p><strong>Check Interval:</strong> <span class="ultra-fast">Every 1-2 seconds</span></p>
                     <p><strong>Detection:</strong> Improved algorithm (no false positives)</p>
-                    <p><strong>Status:</strong> <span id="status">Active</span></p>
-                    <p><strong>Last Check:</strong> <span id="time">""" + time.strftime('%Y-%m-%d %H:%M:%S') + """</span></p>
+                    <p><strong>Crash Protection:</strong> Auto-restart on failures</p>
+                    <p><strong>Status:</strong> <span id="status">Active & Monitoring</span></p>
+                    <p><strong>Last Check:</strong> <span id="time">{time.strftime('%Y-%m-%d %H:%M:%S')}</span></p>
+                    <p><strong>Uptime:</strong> <span id="uptime">Running</span></p>
                 </div>
                 
                 <p>This service automatically detects when numbers brighten up in FlashSport Keno and sends instant Telegram notifications.</p>
-                <p class="ultra-fast">⚡ Monitoring at maximum speed with improved accuracy!</p>
+                <p class="ultra-fast">⚡ Monitoring at maximum speed with crash protection!</p>
                 
                 <script>
-                    function updateTime() {
+                    function updateTime() {{
                         document.getElementById('time').textContent = new Date().toLocaleString();
-                    }
+                    }}
                     setInterval(updateTime, 1000);
                 </script>
             </div>
@@ -297,7 +331,8 @@ def health():
         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
         "monitoring": "https://flashsport.bet/",
         "check_interval": "1-2 seconds",
-        "detection": "improved-accuracy"
+        "crash_protection": "enabled",
+        "restarts": monitor_status["restart_count"]
     })
 
 @app.route('/status')
@@ -306,19 +341,79 @@ def status():
         "status": "running",
         "monitoring": "flashsport.bet/keno", 
         "check_interval": "1-2 seconds",
-        "detection": "improved-accuracy",
+        "crash_protection": "enabled",
+        "restart_count": monitor_status["restart_count"],
+        "last_restart": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(monitor_status["last_restart"])),
         "uptime": "24/7"
     })
 
+@app.route('/monitor-status')
+def monitor_status_route():
+    """Check if monitor thread is alive"""
+    import threading
+    active_threads = [t.name for t in threading.enumerate()]
+    monitor_alive = any('Thread' in str(t) for t in active_threads)
+    
+    return jsonify({
+        "monitor_alive": monitor_alive,
+        "active_threads": len(active_threads),
+        "thread_names": active_threads,
+        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')
+    })
+
 def start_monitor_thread():
-    """Start the monitor in a separate thread"""
-    monitor_thread = threading.Thread(target=start_async_monitor)
+    """Start the monitor in a separate thread with CRASH RECOVERY"""
+    def monitor_with_restart():
+        global monitor_status
+        restart_count = 0
+        max_restarts = 20  # Increased max restarts
+        
+        while restart_count < max_restarts:
+            try:
+                monitor_status["restart_count"] = restart_count
+                monitor_status["last_restart"] = time.time()
+                
+                logger.info(f"🚀 Starting monitor thread (attempt {restart_count + 1})")
+                start_async_monitor()
+                
+            except Exception as e:
+                restart_count += 1
+                logger.error(f"Monitor thread crashed! Restarting in 15 seconds... Error: {e}")
+                time.sleep(15)  # Wait 15 seconds before restart
+                
+        logger.error("❌ Monitor thread failed too many times. Manual intervention required.")
+    
+    monitor_thread = threading.Thread(target=monitor_with_restart, name="KenoMonitorThread")
     monitor_thread.daemon = True
     monitor_thread.start()
-    logger.info("🚀 Ultra-fast monitor thread started")
+    logger.info("🚀 Crash-resistant monitor thread started")
+
+# Test Telegram connection on startup
+async def test_telegram_connection():
+    """Test if Telegram bot can send messages"""
+    monitor = KenoCloudMonitor()
+    if monitor.telegram_token and monitor.chat_id:
+        try:
+            await monitor.bot.send_message(
+                chat_id=monitor.chat_id,
+                text="🔧 **Keno Monitor Started** \n✅ Crash-resistant version activated\n⚡ Monitoring every 1-2 seconds\n🛡️ Auto-restart on failures",
+                parse_mode='Markdown'
+            )
+            logger.info("✅ Telegram test message sent successfully!")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Telegram test failed: {e}")
+            return False
+    return False
 
 if __name__ == "__main__":
-    # Start the ultra-fast monitor
+    # Test Telegram connection
+    try:
+        asyncio.run(test_telegram_connection())
+    except Exception as e:
+        logger.error(f"Telegram test error: {e}")
+    
+    # Start the crash-resistant monitor
     start_monitor_thread()
     
     # Start Flask app

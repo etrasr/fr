@@ -9,7 +9,6 @@ import time
 import re
 import threading
 from flask import Flask, jsonify
-import concurrent.futures
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -56,63 +55,85 @@ class KenoCloudMonitor:
     
     def detect_bright_numbers(self, html_content):
         """
-        ULTRA FAST detection optimized for speed
+        IMPROVED DETECTION - Avoids false positives from number grid
+        Only detects actual bright/preview numbers
         """
         if not html_content:
             return set()
         
         try:
+            soup = BeautifulSoup(html_content, 'html.parser')
             bright_numbers = set()
             
-            # STRATEGY 1: Ultra-fast regex scanning (bypass BeautifulSoup when possible)
-            # Look for number patterns with bright indicators nearby
+            # STRATEGY 1: Look for VERY specific bright/flash indicators
+            strong_indicators = ['blink', 'flash', 'pulse', 'shine', 'glowing', 'preview', 'nextdraw']
+            
+            for indicator in strong_indicators:
+                # Look for elements with these specific classes
+                elements = soup.find_all(class_=re.compile(indicator, re.IGNORECASE))
+                for element in elements:
+                    text = element.get_text().strip()
+                    if text.isdigit() and 1 <= int(text) <= 80:
+                        bright_numbers.add(int(text))
+                        logger.info(f"Found number {text} via strong indicator: {indicator}")
+            
+            # STRATEGY 2: Look for elements with animation styles
+            animated_elements = soup.find_all(style=re.compile(
+                'animation|blink|flash|glow|pulse', re.IGNORECASE
+            ))
+            for element in animated_elements:
+                text = element.get_text().strip()
+                if text.isdigit() and 1 <= int(text) <= 80:
+                    bright_numbers.add(int(text))
+                    logger.info(f"Found number {text} via animation style")
+            
+            # STRATEGY 3: Look for temporary/preview containers
+            preview_containers = soup.find_all(class_=re.compile(
+                'preview|next|upcoming|temp|short|live', re.IGNORECASE
+            ))
+            for container in preview_containers:
+                numbers = re.findall(r'\b([1-9]|[1-7][0-9]|80)\b', container.get_text())
+                for num in numbers:
+                    if 1 <= int(num) <= 80:
+                        bright_numbers.add(int(num))
+                        logger.info(f"Found number {num} in preview container")
+            
+            # STRATEGY 4: Ultra-fast regex scanning for bright patterns
             bright_patterns = [
-                r'class="[^"]*(bright|highlight|active|blink|flash|glow|selected|current|new|preview)[^"]*"[^>]*>.*?(\d{1,2})<',
-                r'>(\d{1,2})<[^<]*(bright|highlight|active|blink|flash|glow|selected|current|new|preview)',
-                r'style="[^"]*(bright|highlight|glow|animation|blink)[^"]*"[^>]*>.*?(\d{1,2})<'
+                r'class="[^"]*(blink|flash|pulse|glowing)[^"]*"[^>]*>.*?(\d{1,2})<',
+                r'style="[^"]*(animation|blink|flash)[^"]*"[^>]*>.*?(\d{1,2})<',
+                r'<[^>]*(blink|flash|pulse)[^>]*>.*?(\d{1,2})<'
             ]
             
             for pattern in bright_patterns:
                 matches = re.finditer(pattern, html_content, re.IGNORECASE | re.DOTALL)
                 for match in matches:
-                    # Extract the number from different capture groups
                     for group in match.groups():
                         if group and group.isdigit() and 1 <= int(group) <= 80:
                             bright_numbers.add(int(group))
+                            logger.info(f"Found number {group} via regex pattern")
             
-            # STRATEGY 2: Fast BeautifulSoup scan only if needed
-            if not bright_numbers:
-                soup = BeautifulSoup(html_content, 'html.parser')
-                
-                # Look for elements with bright-related attributes
-                bright_indicators = ['bright', 'highlight', 'active', 'blink', 'flash', 'glow', 'selected', 'current', 'new', 'preview']
-                
-                for indicator in bright_indicators:
-                    elements = soup.find_all(class_=re.compile(indicator, re.IGNORECASE))
-                    for element in elements:
-                        text = element.get_text().strip()
-                        if text.isdigit() and 1 <= int(text) <= 80:
-                            bright_numbers.add(int(text))
-                
-                # Check inline styles
-                elements_with_style = soup.find_all(style=re.compile('bright|glow|blink|animation', re.IGNORECASE))
-                for element in elements_with_style:
-                    text = element.get_text().strip()
-                    if text.isdigit() and 1 <= int(text) <= 80:
-                        bright_numbers.add(int(text))
+            # FILTER OUT FALSE POSITIVES
+            filtered_numbers = set()
             
-            # STRATEGY 3: Small number set detection
-            if not bright_numbers:
-                # Quick regex to find all numbers on page
-                all_numbers = re.findall(r'\b([1-9]|[1-7][0-9]|80)\b', html_content)
-                unique_numbers = set(all_numbers)
-                
-                # If we have a small subset (likely preview), use them
-                if 1 <= len(unique_numbers) <= 10:
-                    for num in unique_numbers:
-                        bright_numbers.add(int(num))
+            # Don't alert for too many numbers (likely the full grid)
+            if len(bright_numbers) > 15:
+                logger.info(f"Too many numbers detected ({len(bright_numbers)}), likely false positive. Skipping.")
+                return set()
             
-            return bright_numbers
+            # Don't alert for sequential numbers starting from 1 (likely the grid)
+            if (bright_numbers and 
+                min(bright_numbers) == 1 and 
+                max(bright_numbers) >= 10 and 
+                len(bright_numbers) >= 8):
+                logger.info("Detected sequential numbers 1-10+, likely the grid. Skipping.")
+                return set()
+            
+            # Only return numbers that passed all filters
+            filtered_numbers = bright_numbers
+            
+            logger.info(f"Final filtered detection: {filtered_numbers}")
+            return filtered_numbers
             
         except Exception as e:
             logger.error(f"Error parsing HTML: {e}")
@@ -155,22 +176,25 @@ class KenoCloudMonitor:
             logger.error(f"Error sending Telegram message: {e}")
     
     async def check_and_alert(self):
-        """Perform one check cycle - OPTIMIZED FOR SPEED"""
+        """Perform one check cycle - OPTIMIZED FOR SPEED & ACCURACY"""
         try:
             html_content = self.fetch_website_content()
             if html_content:
                 current_numbers = self.detect_bright_numbers(html_content)
                 
-                # Only alert if we found some numbers (not empty) and they're new
-                if current_numbers and current_numbers != self.last_detected_numbers:
-                    logger.info(f"🚨 NEW BRIGHT NUMBERS: {current_numbers}")
+                # Only alert if we found valid numbers and they're new
+                if (current_numbers and 
+                    current_numbers != self.last_detected_numbers and
+                    1 <= len(current_numbers) <= 15):  # Only alert for reasonable sets
+                    
+                    logger.info(f"🚨 VALID BRIGHT NUMBERS DETECTED: {current_numbers}")
                     await self.send_telegram_alert(current_numbers, "bright")
                     self.last_detected_numbers = current_numbers
-                # else:
-                #     logger.info("No new bright numbers detected")
-            # else:
-            #     logger.warning("Failed to fetch website content")
-                
+                else:
+                    if current_numbers:
+                        logger.info(f"Ignoring likely false positive: {current_numbers}")
+                    # else: normal no detection
+                    
         except Exception as e:
             logger.error(f"Check error: {e}")
 
@@ -185,7 +209,10 @@ async def monitor_loop():
     logger.info("🚀 Starting ULTRA-FAST Keno Monitor (1-2 second checks)")
     
     # Send startup message
-    await monitor.send_telegram_alert(set(), "status")
+    try:
+        await monitor.send_telegram_alert(set(), "status")
+    except Exception as e:
+        logger.error(f"Failed to send startup message: {e}")
     
     # Ultra-fast monitoring loop
     check_count = 0
@@ -195,9 +222,12 @@ async def monitor_loop():
             await monitor.check_and_alert()
             check_count += 1
             
-            # Send status every 100 checks (~2-3 minutes)
-            if check_count % 100 == 0:
-                await monitor.send_telegram_alert(set(), "status")
+            # Send status every 150 checks (~3-5 minutes)
+            if check_count % 150 == 0:
+                try:
+                    await monitor.send_telegram_alert(set(), "status")
+                except Exception as e:
+                    logger.error(f"Failed to send status update: {e}")
                 check_count = 0
             
             # Dynamic sleep to maintain 1-2 second intervals
@@ -240,13 +270,13 @@ def home():
                 <div class="info">
                     <p><strong>Monitoring:</strong> https://flashsport.bet/</p>
                     <p><strong>Check Interval:</strong> <span class="ultra-fast">Every 1-2 seconds</span></p>
+                    <p><strong>Detection:</strong> Improved algorithm (no false positives)</p>
                     <p><strong>Status:</strong> <span id="status">Active</span></p>
                     <p><strong>Last Check:</strong> <span id="time">""" + time.strftime('%Y-%m-%d %H:%M:%S') + """</span></p>
-                    <p><strong>Optimized for:</strong> Instant detection of brief bright number events</p>
                 </div>
                 
                 <p>This service automatically detects when numbers brighten up in FlashSport Keno and sends instant Telegram notifications.</p>
-                <p class="ultra-fast">⚡ Monitoring at maximum speed to never miss brief bright number events!</p>
+                <p class="ultra-fast">⚡ Monitoring at maximum speed with improved accuracy!</p>
                 
                 <script>
                     function updateTime() {
@@ -267,7 +297,7 @@ def health():
         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
         "monitoring": "https://flashsport.bet/",
         "check_interval": "1-2 seconds",
-        "optimization": "ultra-fast"
+        "detection": "improved-accuracy"
     })
 
 @app.route('/status')
@@ -276,7 +306,7 @@ def status():
         "status": "running",
         "monitoring": "flashsport.bet/keno", 
         "check_interval": "1-2 seconds",
-        "optimization": "ultra-fast",
+        "detection": "improved-accuracy",
         "uptime": "24/7"
     })
 
